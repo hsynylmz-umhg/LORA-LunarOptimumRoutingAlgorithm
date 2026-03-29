@@ -222,7 +222,7 @@ Her Webots Timestep (32 ms):
 **L.O.R.A. Hackathon Takımı**
 - Proje Yöneticisi & 3D Tasarım: *Mesut Azak*
 - Yazılım, Algoritma & Simülasyon: *Hüseyin Yılmaz*
-- Veri seti ve Kaynak Araştırma: *Yusuf Can Polat / Havva Şahin*
+- Veri seti ve Kaynak Araştırma: *Yusuf Çağdaş Canpolat / Havva Şahin*
 
 ---
 
