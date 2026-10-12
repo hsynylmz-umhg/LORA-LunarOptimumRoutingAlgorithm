@@ -1,530 +1,477 @@
-# filepath: LORA/webots/controllers/lora_controller/lora_controller.py
-"""
-L.O.R.A. — Lunar Optimum Routing Algorithm  |  v1.0 HACKATHON FINAL
-════════════════════════════════════════════════════════════════════
-  Düzeltmeler (v1.0):
-    FIX-4a  Rota bulunamazsa araç KESINLIKLE DURUR → "ROTA YOK" logu
-    FIX-4b  Her replan sonrası path listesi UDP TYPE_PATH ile yayınlanır
-            → lora_master.py UI'ında mavi çizgi güncellenir
-    (FIX-1/2/3 master tarafında)
-════════════════════════════════════════════════════════════════════
-"""
+"""LORA ENU controller: finite sensors, occupancy replanning and safe stops.
 
-from controller import Robot
+Webots passes the absolute mission JSON path in controllerArgs. The controller
+uses simulation time, emits versioned UDP, and always writes mission_result.json.
+"""
+from __future__ import annotations
 
-import sys
+import json
 import math
-import time
-import socket
-import struct
-import numpy as np
 from pathlib import Path
+import socket
+import sys
+import traceback
 
-_CTRL_DIR = Path(__file__).resolve().parent
-_SRC_DIR  = _CTRL_DIR.parent.parent.parent / "src"
-sys.path.insert(0, str(_SRC_DIR / "algorithm"))
+import numpy as np
+from controller import Supervisor
 
-from pathfinder  import Pathfinder
-from slam_mapper import SlamMapper
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT))
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  PARAMETRELERİ BURADAN DEĞİŞTİR
-# ══════════════════════════════════════════════════════════════════════════════
-
-TIME_STEP = 32
-
-GRID_SIZE   = 500
-WORLD_SIZE  = 500
-CELL_SIZE_M = 1.0
-OFFSET_X    = -WORLD_SIZE / 2.0
-OFFSET_Z    = -WORLD_SIZE / 2.0
-
-_BASE_DIR     = _CTRL_DIR.parent.parent.parent
-_MISSION_FILE = _BASE_DIR / "data" / "processed" / "mission_params.txt"
-LOW_MAP_PATH  = _BASE_DIR / "data" / "raw" / "low_detail_map.csv"
-HIGH_MAP_PATH = _BASE_DIR / "data" / "raw" / "high_detail_map.csv"
-
-DEFAULT_START = (-220.0, -220.0)
-DEFAULT_GOAL  = ( 220.0,  220.0)
-
-MOTOR_FL = "front left wheel"
-MOTOR_FR = "front right wheel"
-MOTOR_BL = "back left wheel"
-MOTOR_BR = "back right wheel"
-
-MAX_SPEED    = 6.28
-CRUISE_SPEED = 4.0
-TURN_SPEED   = 2.0
-
-KP = 0.045
-KD = 0.008
-MAX_STEER = MAX_SPEED * 0.85
-
-# Dinamik eğim fiziği
-PITCH_DOWN   = -8.0    # dereceyi geç → hızı kıs
-PITCH_UP     =  8.0    # dereceyi geç → hızı artır
-SCALE_DOWN   = 0.42    # iniş çarpanı
-SCALE_UP     = 1.18    # çıkış çarpanı (MAX_SPEED ile sınırlı)
-
-# LIDAR
-LIDAR_NAME  = "lidar"
-LIDAR_MAX   = 30.0
-LIDAR_EMRG  = 1.2     # acil dur
-LIDAR_AVOD  = 4.0     # yavaşla
-LIDAR_CLR   = 8.0     # temiz
-LIDAR_ARC   = 60.0
-LIDAR_TURN  = 35.0
-LIDAR_OVR_S = 2.8
-
-# UDP
-UDP_HOST = "127.0.0.1"
-UDP_PORT = 5005
-
-TYPE_POS  = 1
-TYPE_OBS  = 2
-TYPE_DON  = 3
-TYPE_PATH = 4    # FIX-4b: rota listesi
-
-GOAL_R    = 5.0
-WP_R      = 2.5
-LOG_N     = 40
+from src.algorithm.pathfinder import Pathfinder
+from src.algorithm.slam_mapper import SlamMapper
+from src.navigation import (LIDAR_UP_M, compass_yaw, front_clearance,
+                            project_return, scan_points, telemetry_waypoints, wheel_speeds)
+from src.telemetry import encode_packet
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  YARDIMCI FONKSİYONLAR
-# ══════════════════════════════════════════════════════════════════════════════
+class LoraController:
+    def __init__(self, robot, mission_path):
+        self.robot = robot
+        self.mission_path = Path(mission_path).resolve()
+        self.config = json.loads(self.mission_path.read_text(encoding="utf-8-sig"))
+        if self.config.get("schema_version") != 1:
+            raise ValueError("Unsupported mission schema_version")
+        self.run_id = self.config["run_id"]
+        safe_run_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(self.run_id))[:80]
+        self.log_path = ROOT / "logs" / f"controller-{safe_run_id}.log"
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log_path.write_text("", encoding="utf-8")
+        self.log_bytes = 0
+        self.last_pose_log = -math.inf
+        self.preview_exported = False
+        self.goal = tuple(float(v) for v in self.config["goal"])
+        if len(self.goal) != 2 or not all(math.isfinite(v) for v in self.goal):
+            raise ValueError("Mission goal must contain two finite coordinates")
+        self.timestep = int(round(robot.getBasicTimeStep()))
+        self.started = robot.getTime()
+        self.timeout = float(self.config.get("timeout_sim_s", 300))
+        if not math.isfinite(self.timeout) or self.timeout <= 0:
+            raise ValueError("timeout_sim_s must be finite and positive")
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.address = (self.config.get("udp_host", "127.0.0.1"),
+                        int(self.config.get("udp_port", 5005)))
+        self.motors = []
+        self.devices = {}
+        self.last_position = None
+        self.previous_sample = None
+        self.last_telemetry = -math.inf
+        self.last_replan = -math.inf
+        self.no_route_since = None
+        self.progress_position = None
+        self.progress_time = self.started
+        self.replans = 0
+        self.planned = False
+        self.map_changed = False
+        self.finished = False
+        self.invalid_sensor_frames = 0
+        self.sensor_invalid_since = None
+        self.valid_sensor_frames = 0
+        self.minimum_clearance = math.inf
+        self.result = None
+        self.obstacle_contact_frames = 0
+        self.chassis_contact_frames = 0
+        self.obstacle_nodes = []
+        self.chassis_node = None
+        self.contact_tracking_available = False
+        self._setup()
 
-def _read_mission():
-    if not _MISSION_FILE.exists():
-        return DEFAULT_START, DEFAULT_GOAL, UDP_HOST, UDP_PORT
-    cfg = {}
-    for ln in _MISSION_FILE.read_text().splitlines():
-        if "=" in ln:
-            k, v = ln.strip().split("=", 1)
-            cfg[k.strip()] = v.strip()
-    s = (float(cfg.get("START_X", DEFAULT_START[0])),
-         float(cfg.get("START_Z", DEFAULT_START[1])))
-    g = (float(cfg.get("GOAL_X",  DEFAULT_GOAL[0])),
-         float(cfg.get("GOAL_Z",  DEFAULT_GOAL[1])))
-    return s, g, cfg.get("UDP_HOST", UDP_HOST), int(cfg.get("UDP_PORT", UDP_PORT))
-
-
-def compass_hdg(north):
-    return math.degrees(math.atan2(north[0], -north[2])) % 360.0
-
-def adiff(tgt, cur):
-    return ((tgt - cur + 180.0) % 360.0) - 180.0
-
-def bearing(pos, tgt):
-    return math.degrees(math.atan2(tgt[0]-pos[0], -(tgt[1]-pos[1]))) % 360.0
-
-def gps_cell(x, z):
-    c = max(0, min(GRID_SIZE-1, int((x - OFFSET_X) / CELL_SIZE_M)))
-    r = max(0, min(GRID_SIZE-1, int((z - OFFSET_Z) / CELL_SIZE_M)))
-    return r, c
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  UDP GÖNDERİCİ
-# ══════════════════════════════════════════════════════════════════════════════
-
-class UDPSender:
-    def __init__(self, host, port):
-        self._s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._a = (host, port)
-
-    def pos(self, x, z, spd, hdg):
+    def send(self, kind, **fields):
+        payload = dict(version=1, run_id=self.run_id, type=kind, **fields)
         try:
-            self._s.sendto(struct.pack("<Bffff", TYPE_POS, x, z, spd, hdg), self._a)
-        except OSError: pass
+            self.socket.sendto(encode_packet(payload), self.address)
+        except OSError:
+            pass  # UI is optional; the result file is the durable outcome.
 
-    def obs(self, ox, oz, h):
+    def log_event(self, event, **fields):
+        """Persist bounded JSONL diagnostics even when Webots loses stdout."""
+        record = dict(run_id=self.run_id, time=self.robot.getTime() - self.started,
+                      event=event, **fields)
+        line = (json.dumps(record, allow_nan=False, ensure_ascii=True) + "\n").encode("utf-8")
+        if len(line) > 16384:
+            record = dict(run_id=self.run_id, time=self.robot.getTime() - self.started,
+                          event=event, truncated=True, detail=line[:12000].decode("utf-8", errors="replace"))
+            line = (json.dumps(record, ensure_ascii=True) + "\n").encode("utf-8")
         try:
-            self._s.sendto(struct.pack("<Bfff", TYPE_OBS, ox, oz, h), self._a)
-        except OSError: pass
+            if self.log_bytes + len(line) > 512 * 1024:
+                tail = self.log_path.read_bytes()[-256 * 1024:]
+                tail = tail.partition(b"\n")[2]
+                self.log_path.write_bytes(tail)
+                self.log_bytes = len(tail)
+            with self.log_path.open("ab") as stream:
+                stream.write(line)
+            self.log_bytes += len(line)
+        except OSError:
+            pass
 
-    def done(self):
+    def export_preview(self):
+        preview = self.config.get("preview_path")
+        if not preview or not hasattr(self.robot, "exportImage"):
+            return
         try:
-            self._s.sendto(struct.pack("<B", TYPE_DON), self._a)
-        except OSError: pass
+            path = Path(preview).resolve()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.robot.exportImage(str(path), 90)
+            self.preview_exported = True
+            self.log_event("preview", path=str(path))
+        except Exception as error:
+            self.log_event("preview_error", message=str(error))
 
-    def path(self, waypoints_m: list):
-        """
-        FIX-4b ▸ A* rota listesini UDP ile master'a gönderir.
-        Format: uint8(4) | uint16(count) | [float32 x, float32 z] × count
-        500 waypoint sınırı — daha uzun rotalar kırpılır.
-        """
-        pts = waypoints_m[:500]
-        n   = len(pts)
-        buf = struct.pack("<BH", TYPE_PATH, n)
-        for px, pz in pts:
-            buf += struct.pack("<ff", px, pz)
-        try:
-            self._s.sendto(buf, self._a)
-        except OSError: pass
+    def setup_contacts(self):
+        count = int(self.config.get("obstacle_count", 0))
+        if hasattr(self.robot, "getSelf"):
+            node = self.robot.getSelf()
+            if node is not None and hasattr(node, "enableContactPointsTracking"):
+                node.enableContactPointsTracking(self.timestep, False)
+                self.chassis_node = node
+        if hasattr(self.robot, "getFromDef"):
+            for index in range(count):
+                node = self.robot.getFromDef(f"OBSTACLE_{index}")
+                if node is not None and hasattr(node, "enableContactPointsTracking"):
+                    node.enableContactPointsTracking(self.timestep, False)
+                    self.obstacle_nodes.append(node)
+        self.contact_tracking_available = (self.chassis_node is not None and
+                                           len(self.obstacle_nodes) == count)
+        self.log_event("contact_tracking", available=self.contact_tracking_available,
+                       requested_obstacles=count, tracked_obstacles=len(self.obstacle_nodes))
 
-    def close(self):
-        self._s.close()
+    def detect_contacts(self):
+        # Descendants are excluded so normal wheel-ground contact is not a chassis contact.
+        if self.chassis_node is not None and self.chassis_node.getContactPoints(False):
+            self.chassis_contact_frames += 1
+        collision = any(node.getContactPoints(False) for node in self.obstacle_nodes)
+        if collision:
+            self.obstacle_contact_frames += 1
+            self.log_event("obstacle_contact", frame=self.obstacle_contact_frames)
+        return collision
 
+    def status(self, state, message):
+        self.log_event("status", state=state, message=message)
+        print(f"[LORA] {state}: {message}", flush=True)
+        self.send("status", state=state, message=message)
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  LIDAR İŞLEMCİ
-# ══════════════════════════════════════════════════════════════════════════════
+    def _setup(self):
+        for name in ("front left wheel", "front right wheel", "back left wheel", "back right wheel"):
+            motor = self.robot.getDevice(name)
+            if motor is None:
+                raise RuntimeError(f"Required motor is missing: {name}")
+            motor.setPosition(float("inf"))
+            motor.setVelocity(0.0)
+            self.motors.append(motor)
+        for name in ("gps", "compass", "lidar", "inertial unit"):
+            device = self.robot.getDevice(name)
+            if device is None:
+                raise RuntimeError(f"Required sensor is missing: {name}")
+            device.enable(self.timestep)
+            self.devices[name] = device
+        self.gps = self.devices["gps"]
+        self.compass = self.devices["compass"]
+        self.lidar = self.devices["lidar"]
+        self.imu = self.devices["inertial unit"]
+        self.resolution = self.lidar.getHorizontalResolution()
+        self.fov = self.lidar.getFov()
+        self.max_range = self.lidar.getMaxRange()
+        map_path = Path(self.config["map_path"])
+        if not map_path.is_absolute():
+            map_path = self.mission_path.parent / map_path
+        self.heightmap = np.load(map_path, allow_pickle=False)
+        self.cell_size = float(self.config["cell_size"])
+        self.offset_x = float(self.config["offset_x"])
+        self.offset_y = float(self.config["offset_y"])
+        self.mapper = SlamMapper(self.heightmap, cell_size=self.cell_size, inflation_radius_m=0.7)
+        self.planner = Pathfinder(self.heightmap, cell_size=self.cell_size,
+                                  max_slope=float(self.config.get("max_slope", 20)),
+                                  world_offset_x=self.offset_x, world_offset_z=self.offset_y,
+                                  blocked=self.mapper.blocked)
+        self.setup_contacts()
+        self.status("starting", "Waiting for finite sensors and suspension settling")
 
-class LidarProc:
-    def __init__(self, dev, fov_deg, nrays):
-        self.dev    = dev
-        self.angles = [
-            math.radians(-fov_deg/2 + fov_deg*i/max(nrays-1,1))
-            for i in range(nrays)
-        ]
+    def set_motors(self, left, right):
+        if not all(math.isfinite(v) for v in (left, right)):
+            left = right = 0.0
+        for motor, speed in zip(self.motors, (left, right, left, right)):
+            limit = min(6.0, motor.getMaxVelocity())
+            motor.setVelocity(max(-limit, min(limit, speed)))
 
-    def analyze(self):
-        ranges   = self.dev.getRangeImage()
-        half_arc = math.radians(LIDAR_ARC)
-        L, R     = [], []
-        for i, a in enumerate(self.angles):
-            if abs(a) > half_arc: continue
-            d = (ranges[i] if ranges else LIDAR_MAX)
-            if d <= 0 or d > LIDAR_MAX: d = LIDAR_MAX
-            (L if a < 0 else R).append(d)
-        lm = min(L) if L else LIDAR_MAX
-        rm = min(R) if R else LIDAR_MAX
-        mn = min(lm, rm)
-        side = "clear"
-        if mn < LIDAR_AVOD:
-            side = "left" if lm < rm else ("right" if rm < lm else "center")
-        return {"min": mn, "left": lm, "right": rm,
-                "side": side, "blocked": mn < LIDAR_EMRG}
+    def stop(self):
+        self.set_motors(0.0, 0.0)
 
-    def slam_pts(self, gx, gz, hdg, hy):
-        ranges   = self.dev.getRangeImage()
-        half_arc = math.radians(LIDAR_ARC)
-        out = []
-        for i, rel in enumerate(self.angles):
-            if abs(rel) > half_arc: continue
-            d = (ranges[i] if ranges else LIDAR_MAX)
-            if d <= 0 or d >= LIDAR_MAX * 0.95: continue
-            aa  = math.radians(hdg) + rel
-            ox  = gx + d * math.sin(aa)
-            oz  = gz - d * math.cos(aa)
-            r,c = gps_cell(ox, oz)
-            out.append((r, c, hy + 0.5))
-        return out
-
-    def obs_gps(self, gx, gz, hdg):
-        ranges   = self.dev.getRangeImage()
-        half_arc = math.radians(LIDAR_ARC)
-        out = []
-        for i, rel in enumerate(self.angles):
-            if abs(rel) > half_arc: continue
-            d = (ranges[i] if ranges else LIDAR_MAX)
-            if d <= 0 or d >= LIDAR_AVOD: continue
-            aa = math.radians(hdg) + rel
-            out.append((gx + d * math.sin(aa), gz - d * math.cos(aa)))
-        return out
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ANA KONTROLCÜ
-# ══════════════════════════════════════════════════════════════════════════════
-
-class LoraController(Robot):
-
-    def __init__(self):
-        super().__init__()
-        print("=" * 62)
-        print("  L.O.R.A. v1.0 — Kontrolcü Başlıyor")
-        print("=" * 62)
-
-        self._ts       = TIME_STEP
-        self._step     = 0
-        self._done     = False
-        self._t0       = time.time()
-        self._prev_err = 0.0
-
-        # FIX-4a ▸ rota yok sayacı ve durum bayrağı
-        self._no_path  = False       # True iken araç durur
-        self._no_path_logged = False
-
-        # LIDAR override
-        self._ovr      = False
-        self._ovr_t    = 0.0
-        self._ovr_dir  = 1.0
-        self._last_spd = (0.0, 0.0)
-
-        start_m, goal_m, udp_h, udp_p = _read_mission()
-        self._goal_m = goal_m
-        self._udp    = UDPSender(udp_h, udp_p)
-        print(f"  Start: {start_m}  →  Goal: {goal_m}")
-
-        self._init_hw()
-        self._init_lora(start_m, goal_m)
-        print("\n✅ Hazır.\n")
-
-    # ── Donanım ───────────────────────────────────────────────────────────────
-
-    def _init_hw(self):
-        print("[1/3] Donanım...")
-
-        self._gps = self.getDevice("gps"); self._gps.enable(TIME_STEP)
-        self._cmp = self.getDevice("compass"); self._cmp.enable(TIME_STEP)
-
-        self._imu = self.getDevice("inertial unit")
-        if self._imu:
-            self._imu.enable(TIME_STEP); self._has_imu = True
-            print("  IMU: ✓")
-        else:
-            self._has_imu = False
-            print("  IMU: yok — eğim fiziği devre dışı")
-
-        ld = self.getDevice(LIDAR_NAME)
-        if ld:
-            ld.enable(TIME_STEP); ld.enablePointCloud()
-            self._lidar    = LidarProc(ld, math.degrees(ld.getFov()),
-                                        ld.getNumberOfPoints())
-            self._has_lidar = True
-            print(f"  LIDAR: FOV={math.degrees(ld.getFov()):.0f}° ✓")
-        else:
-            self._has_lidar = False
-            print("  LIDAR: yok")
-
-        self._fl = self.getDevice(MOTOR_FL)
-        self._fr = self.getDevice(MOTOR_FR)
-        self._bl = self.getDevice(MOTOR_BL)
-        self._br = self.getDevice(MOTOR_BR)
-        for m in (self._fl, self._fr, self._bl, self._br):
-            m.setPosition(float("inf")); m.setVelocity(0.0)
-        print("  Motorlar: ✓")
-
-    # ── L.O.R.A. ──────────────────────────────────────────────────────────────
-
-    def _init_lora(self, start_m, goal_m):
-        print("[2/3] Haritalar...")
-
-        def ld(p):
-            if not p.exists():
-                raise FileNotFoundError(f"{p} yok — generate_terrain çalıştır.")
-            d = np.loadtxt(str(p), delimiter=" ", dtype=np.float64)
-            print(f"  {p.name}: {d.shape}")
-            return d
-
-        low = ld(LOW_MAP_PATH)
-        ld(HIGH_MAP_PATH)   # varlık kontrolü
-
-        print("[3/3] Pathfinder + SlamMapper...")
-        self._mapper = SlamMapper(LOW_MAP_PATH)
-        self._pf     = Pathfinder(low, cell_size=CELL_SIZE_M,
-                                   world_offset_x=OFFSET_X,
-                                   world_offset_z=OFFSET_Z)
-        self._plan(start_m)
-
-    def _plan(self, current_m=None):
-        """
-        FIX-4a ▸ Rota bulunamazsa self._no_path = True.
-        FIX-4b ▸ Rota bulununca UDP TYPE_PATH paketi gönderilir.
-        """
-        if current_m is None:
-            v = self._gps.getValues()
-            current_m = (v[0], v[2])
-
-        ok = self._pf.plan(current_m, self._goal_m)
-
+    def plan(self, position):
+        self.stop()
+        self.last_replan = self.robot.getTime()
+        self.replans += int(self.planned)
+        self.planned = True
+        self.map_changed = False
+        ok = self.planner.plan(position, self.goal)
         if not ok:
-            self._no_path = True
-            print("[Pathfinder] ⚠ ROTA YOK — araç durdu.")
+            self.send("path", points=[])
+            if self.no_route_since is None:
+                self.no_route_since = self.last_replan
+                self.status("no_route", "No traversable route; motors stopped")
             return False
-
-        self._no_path        = False
-        self._no_path_logged = False
-
-        # FIX-4b ▸ Bulunan rotayı UDP ile gönder
-        if self._pf._path:
-            wpts_m = [self._pf._cell_to_meter(r, c) for r, c in self._pf._path]
-            self._udp.path(wpts_m)
-            s = self._pf.current_path_stats()
-            print(f"  [Plan] {s.get('step_count','?')} adım | "
-                  f"~{s.get('distance_m',0):.0f} m | "
-                  f"MaxEğim:{s.get('max_slope_deg',0):.1f}°")
+        self.no_route_since = None
+        self.send("path", points=telemetry_waypoints(self.planner.waypoints_m))
+        self.status("navigating", f"Route ready; {len(self.planner.waypoints_m)} waypoints")
         return True
 
-    # ── Motor ─────────────────────────────────────────────────────────────────
+    def learn_obstacles(self, position, height, yaw, points):
+        cells = set()
+        observations = []
+        rows, cols = self.heightmap.shape
+        for distance, angle in points:
+            if distance > 4.0 or abs(angle) > math.radians(60):
+                continue
+            x, y = project_return(position, yaw, distance, angle)
+            col = int(round((x - self.offset_x) / self.cell_size))
+            row = int(round((y - self.offset_y) / self.cell_size))
+            if not (0 <= row < rows and 0 <= col < cols):
+                continue
+            # A known terrain rise is already handled by the slope-aware planner.
+            # Occupancy represents returns above the known elevation surface.
+            if self.heightmap[row, col] >= height + LIDAR_UP_M - 0.20:
+                continue
+            cells.add((row, col))
+            observations.append((x, y))
+        if cells and self.mapper.mark_obstacles(cells):
+            self.map_changed = True
+            for x, y in observations[::max(1, len(observations) // 12)]:
+                self.send("obs", x=x, y=y)
 
-    def _set(self, L, R):
-        L = max(-MAX_SPEED, min(MAX_SPEED, L))
-        R = max(-MAX_SPEED, min(MAX_SPEED, R))
-        self._fl.setVelocity(L); self._bl.setVelocity(L)
-        self._fr.setVelocity(R); self._br.setVelocity(R)
-        self._last_spd = (L, R)
+    def measure_motion(self):
+        """Read an actual current GPS speed/pose for terminal evidence and telemetry."""
+        values = self.gps.getValues()
+        north = self.compass.getValues()
+        speed = self.gps.getSpeed()
+        if (len(values) != 3 or len(north) != 3 or
+                not all(math.isfinite(v) for v in (*values, *north, speed)) or speed < 0):
+            return None
+        try:
+            yaw = compass_yaw(north)
+        except ValueError:
+            return None
+        self.last_position = (float(values[0]), float(values[1]))
+        return dict(x=self.last_position[0], y=self.last_position[1],
+                    speed=float(speed), heading=yaw, time=self.robot.getTime() - self.started)
 
-    def _stop(self):
-        self._set(0.0, 0.0)
+    def settle_at_goal(self):
+        """Verify the rover has physically stopped before reporting mission success."""
+        stop_started = self.robot.getTime()
+        measurement = self.measure_motion()
+        self.status("stopping", "Goal radius reached; verifying physical stop")
+        max_steps = max(1, int(3000 // self.timestep))
+        for _ in range(max_steps):
+            self.stop()
+            if self.robot.step(self.timestep) == -1:
+                return False, "simulation_ended_during_stop", measurement
+            measurement = self.measure_motion()
+            if self.detect_contacts():
+                return False, "obstacle_collision", measurement
+            attitude = self.imu.getRollPitchYaw()
+            ranges = self.lidar.getRangeImage()
+            valid = (measurement is not None and len(attitude) == 3 and
+                     all(math.isfinite(v) for v in attitude) and bool(ranges) and
+                     any(v == math.inf or (math.isfinite(v) and v > 0) for v in ranges))
+            if not valid:
+                self.invalid_sensor_frames += 1
+                return False, "sensor_unavailable", measurement
+            self.valid_sensor_frames += 1
+            if max(abs(attitude[0]), abs(attitude[1])) > math.radians(35):
+                return False, "unsafe_rover_tilt", measurement
+            points = list(scan_points(ranges, self.resolution, self.fov, self.max_range))
+            clearance, _, _ = front_clearance(points)
+            self.minimum_clearance = min(self.minimum_clearance, clearance)
+            if self.robot.getTime() - stop_started >= .2 and measurement["speed"] < .02:
+                if math.dist(self.last_position, self.goal) > .65:
+                    return False, "goal_drift_after_stop", measurement
+                return True, "goal_reached", measurement
+        return False, "rover_did_not_stop", measurement
 
-    # ── Pitch / Eğim ──────────────────────────────────────────────────────────
-
-    def _pitch_scale(self):
-        if not self._has_imu: return 1.0
-        pitch = math.degrees(self._imu.getRollPitchYaw()[1])
-        if pitch < PITCH_DOWN:
-            t = min(1.0, (PITCH_DOWN - pitch) / 15.0)
-            return SCALE_DOWN + (1.0 - SCALE_DOWN) * (1.0 - t)
-        if pitch > PITCH_UP:
-            return min(SCALE_UP, 1.0 + 0.15 * min(1.0, (pitch - PITCH_UP) / 15.0))
-        return 1.0
-
-    def _est_speed(self):
-        return (abs(self._last_spd[0]) + abs(self._last_spd[1])) / 2.0 * 0.1975
-
-    # ── PD Sürüş ─────────────────────────────────────────────────────────────
-
-    def _steer(self, gx, gz, hdg, tgt, scale=1.0):
-        des   = bearing((gx, gz), tgt)
-        err   = adiff(des, hdg)
-        d_err = err - self._prev_err
-        st    = max(-MAX_STEER, min(MAX_STEER, KP * err + KD * d_err))
-        self._prev_err = err
-        base  = CRUISE_SPEED * scale
-        self._set(base - st, base + st)
-
-    # ── LIDAR Override ────────────────────────────────────────────────────────
-
-    def _lidar_override(self, info, hdg, gx, gz, gy):
-        dt = TIME_STEP / 1000.0
-
-        if self._ovr:
-            self._ovr_t -= dt
-            if self._ovr_t <= 0:
-                self._ovr = False
-                self._plan()
-                print("[LIDAR] Override bitti.")
-                return False
-            esc = hdg + self._ovr_dir * LIDAR_TURN
-            err = adiff(esc, hdg)
-            st  = max(-MAX_STEER, min(MAX_STEER, KP * err))
-            self._set(TURN_SPEED - st, TURN_SPEED + st)
-            return True
-
-        mn, side = info["min"], info["side"]
-
-        if mn < LIDAR_EMRG:
-            self._stop()
-            print(f"[LIDAR] 🛑 {mn:.2f}m — override!")
-            for ox, oz in self._lidar.obs_gps(gx, gz, hdg):
-                self._udp.obs(ox, oz, gy + 0.5)
-            self._ovr     = True
-            self._ovr_t   = LIDAR_OVR_S
-            self._ovr_dir = -1.0 if side == "left" else 1.0
-            return True
-
-        if mn < LIDAR_AVOD:
-            scale  = max(0.25, (mn - LIDAR_EMRG) / (LIDAR_AVOD - LIDAR_EMRG))
-            bias   = -1.0 if side == "left" else 1.0
-            st_add = bias * TURN_SPEED * (1.0 - scale)
-            if self._step % 10 == 0:
-                for ox, oz in self._lidar.obs_gps(gx, gz, hdg):
-                    self._udp.obs(ox, oz, gy + 0.5)
-            self._set(CRUISE_SPEED * scale - st_add,
-                      CRUISE_SPEED * scale + st_add)
-            return True
-
-        return False
-
-    # ── Ana Döngü ─────────────────────────────────────────────────────────────
+    def finish(self, success, reason):
+        if self.finished:
+            return
+        self.stop()
+        if success:
+            success, reason, measurement = self.settle_at_goal()
+        else:
+            measurement = self.measure_motion()
+        self.finished = True
+        self.stop()
+        self.export_preview()
+        duration = self.robot.getTime() - self.started
+        distance = math.dist(self.last_position, self.goal) if self.last_position else None
+        self.result = dict(run_id=self.run_id, success=bool(success), reason=reason,
+                           duration=duration, final_position=self.last_position,
+                           final_speed=measurement["speed"] if measurement is not None else None,
+                           distance_to_goal=distance, replans=self.replans,
+                           obstacle_contact_frames=self.obstacle_contact_frames,
+                           chassis_contact_frames=self.chassis_contact_frames,
+                           contact_tracking_available=self.contact_tracking_available,
+                           tracked_obstacles=len(self.obstacle_nodes),
+                           controller_log=str(self.log_path),
+                           preview_path=(str(Path(self.config["preview_path"]).resolve())
+                                         if self.preview_exported else None),
+                           sensors=dict(available=list(self.devices),
+                                        valid_frames=self.valid_sensor_frames,
+                                        invalid_frames=self.invalid_sensor_frames,
+                                        minimum_front_clearance=(self.minimum_clearance
+                                            if math.isfinite(self.minimum_clearance) else None)))
+        result_path = self.mission_path.with_name("mission_result.json")
+        temporary = result_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(self.result, indent=2, allow_nan=False), encoding="utf-8")
+        temporary.replace(result_path)
+        np.save(self.mission_path.with_name("learned_obstacles.npy"), self.mapper.blocked)
+        self.log_event("result", result=self.result)
+        if measurement is not None:
+            self.send("pos", **measurement)
+        self.status("complete" if success else "failed", reason)
+        self.send("done", success=bool(success), reason=reason, time=duration,
+                  distance_to_goal=distance, replans=self.replans)
+        if self.config.get("exit_on_complete", False):
+            self.robot.simulationQuit(0 if success else 1)
 
     def run(self):
-        while self.step(self._ts) != -1:
-
-            if self._done:
-                self._stop(); continue
-
-            self._step += 1
-            v   = self._gps.getValues()
-            gx, gy, gz = v[0], v[1], v[2]
-            hdg = compass_hdg(self._cmp.getValues())
-            ps  = self._pitch_scale()
-
-            # Varış
-            d_goal = math.sqrt((gx - self._goal_m[0])**2 +
-                               (gz - self._goal_m[1])**2)
-            if d_goal <= GOAL_R:
-                self._stop(); self._done = True
-                self._udp.done()
-                self._mapper.save_learned_map()
-                self._print_final(); continue
-
-            # ── FIX-4a: ROTA YOK → KESINLIKLE DUR ───────────────────────────
-            if self._no_path:
-                self._stop()
-                if not self._no_path_logged:
-                    print("[Ctrl] ⛔ ROTA YOK - BEKLENİYOR  "
-                          "(Pathfinder engeli aşamıyor)")
-                    self._no_path_logged = True
-                # Her 200 adımda bir yeniden dene
-                if self._step % 200 == 0:
-                    self._plan((gx, gz))
-                continue
-            # ─────────────────────────────────────────────────────────────────
-
-            # LIDAR
-            override = False
-            info     = {"min": LIDAR_MAX, "side": "clear", "blocked": False}
-            if self._has_lidar:
-                info = self._lidar.analyze()
-                if info["min"] < LIDAR_CLR:
-                    pts = self._lidar.slam_pts(gx, gz, hdg, gy)
-                    if pts:
-                        self._mapper.update_map_region(pts)
-                    if self._step % 25 == 0:
-                        self._plan((gx, gz))
-                override = self._lidar_override(info, hdg, gx, gz, gy)
-
-            # A* Navigasyon
-            if not override:
-                tgt = self._pf.get_next_move((gx, gz), WP_R)
-                if tgt is None:
-                    # FIX-4a: yeniden plan dene
-                    ok = self._plan((gx, gz))
-                    if not ok:
-                        # _no_path = True → bir sonraki iterasyonda durulur
-                        pass
+        try:
+            while self.robot.step(self.timestep) != -1:
+                if self.finished:
                     continue
-                self._steer(gx, gz, hdg, tgt, ps)
+                now = self.robot.getTime()
+                elapsed = now - self.started
+                if elapsed >= self.timeout:
+                    self.finish(False, "simulation_timeout")
+                    continue
+                if self.detect_contacts():
+                    self.finish(False, "obstacle_collision")
+                    continue
+                if elapsed >= 1.0 and not self.preview_exported:
+                    self.export_preview()
+                values = self.gps.getValues()
+                north = self.compass.getValues()
+                attitude = self.imu.getRollPitchYaw()
+                ranges = self.lidar.getRangeImage()
+                valid = (len(values) == 3 and len(north) == 3 and len(attitude) == 3 and
+                         all(math.isfinite(v) for v in (*values, *north, *attitude)) and
+                         math.hypot(north[0], north[1]) > 1e-8 and bool(ranges) and
+                         any(v == math.inf or (math.isfinite(v) and v > 0) for v in ranges))
+                if not valid:
+                    self.stop()
+                    self.invalid_sensor_frames += 1
+                    if self.sensor_invalid_since is None:
+                        self.sensor_invalid_since = now
+                        self.log_event("sensor_dropout")
+                    if now - self.sensor_invalid_since >= 5:
+                        self.finish(False, "sensor_unavailable")
+                    continue
+                try:
+                    yaw = compass_yaw(north)
+                except ValueError:
+                    self.stop()
+                    self.invalid_sensor_frames += 1
+                    continue
+                if self.sensor_invalid_since is not None:
+                    self.log_event("sensor_recovered", outage_duration=now - self.sensor_invalid_since)
+                self.sensor_invalid_since = None
+                self.valid_sensor_frames += 1
+                position = (float(values[0]), float(values[1]))
+                self.last_position = position
+                speed = self.gps.getSpeed()
+                if not math.isfinite(speed):
+                    speed = (math.dist(position, self.previous_sample[0]) /
+                             max(now - self.previous_sample[1], 1e-6)) if self.previous_sample else 0.0
+                self.previous_sample = (position, now)
+                if now - self.last_pose_log >= 1:
+                    self.log_event("pose", position=position, speed=float(speed), yaw=yaw,
+                                   goal_distance=math.dist(position, self.goal))
+                    self.last_pose_log = now
+                if now - self.last_telemetry >= 0.16:
+                    self.send("pos", x=position[0], y=position[1], speed=float(speed),
+                              heading=yaw, time=elapsed)
+                    self.last_telemetry = now
+                if elapsed < 0.64:
+                    self.stop()
+                    continue
+                if max(abs(attitude[0]), abs(attitude[1])) > math.radians(35):
+                    self.finish(False, "unsafe_rover_tilt")
+                    continue
+                distance_to_goal = math.dist(position, self.goal)
+                if distance_to_goal <= 0.65:
+                    self.finish(True, "goal_reached")
+                    continue
+                if not self.planned:
+                    self.progress_position = position
+                    self.progress_time = now
+                    self.plan(position)
+                if self.no_route_since is not None:
+                    self.stop()
+                    if now - self.no_route_since >= 3:
+                        self.finish(False, "no_route")
+                    elif now - self.last_replan >= 1:
+                        self.plan(position)
+                    continue
+                points = list(scan_points(ranges, self.resolution, self.fov, self.max_range))
+                clearance, left_clearance, right_clearance = front_clearance(points)
+                self.minimum_clearance = min(self.minimum_clearance, clearance)
+                self.learn_obstacles(position, values[2], yaw, points)
+                if self.map_changed and now - self.last_replan >= 0.8:
+                    if not self.plan(position):
+                        continue
+                if math.dist(position, self.progress_position) >= 0.20:
+                    self.progress_position = position
+                    self.progress_time = now
+                elif now - self.progress_time >= 20:
+                    self.finish(False, "rover_stalled")
+                    continue
+                if clearance < 0.30:
+                    self.finish(False, "obstacle_too_close")
+                    continue
+                if clearance < 0.85:
+                    # Pivot in place; never drive forward while emergency braking.
+                    turn = 1.8 if left_clearance >= right_clearance else -1.8
+                    self.set_motors(-turn, turn)
+                    continue
+                target = self.planner.get_next_move(position, arrival_radius_m=0.35)
+                if target is None:
+                    self.plan(position)
+                    continue
+                speed_limit = min(0.64, max(0.12, 0.55 * distance_to_goal))
+                if clearance < 2.0:
+                    speed_limit *= max(0.2, (clearance - 0.65) / 1.35)
+                speed_limit *= max(0.35, math.cos(attitude[0]) * math.cos(attitude[1]))
+                self.set_motors(*wheel_speeds(position, yaw, target, speed_limit))
+        except Exception as error:
+            traceback.print_exc()
+            self.log_event("exception", traceback=traceback.format_exc())
+            self.finish(False, f"controller_error: {type(error).__name__}: {error}")
+        finally:
+            self.stop()
+            if not self.finished:
+                self.finish(False, "simulation_ended")
+            self.socket.close()
 
-            # UDP
-            if self._step % 3 == 0:
-                self._udp.pos(gx, gz, self._est_speed(), hdg)
 
-            # Log
-            if self._step % LOG_N == 0:
-                t = time.time() - self._t0
-                r, c = gps_cell(gx, gz)
-                print(
-                    f"[{t:6.1f}s] "
-                    f"({gx:+7.1f},{gz:+7.1f}) | "
-                    f"({r:3d},{c:3d}) | "
-                    f"H:{hdg:5.1f}° | "
-                    f"Goal:{d_goal:6.1f}m | "
-                    f"L:{info['min']:4.1f}m | "
-                    f"P:{ps:.2f}x | "
-                    f"OVR:{'Y' if override else 'N'} | "
-                    f"NoPath:{'Y' if self._no_path else 'N'}"
-                )
-
-    # ── Final ─────────────────────────────────────────────────────────────────
-
-    def _print_final(self):
-        e = time.time() - self._t0
-        s = self._mapper.get_update_stats()
-        print("\n" + "=" * 62)
-        print("  🏁  GÖREV TAMAMLANDI!")
-        print(f"  Süre      : {e:.1f}s  |  Adım: {self._step:,}")
-        print(f"  SLAM güncelleme: {s['total_updates']}  |  Öğrenilen hücre: {s['dirty_cell_count']}")
-        ps = self._pf.current_path_stats()
-        if ps:
-            print(f"  Rota: ~{ps['distance_m']:.0f} m")
-        print("=" * 62)
-        self._udp.close()
+def main():
+    robot = Supervisor()
+    mission_path = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "data" / "processed" / "mission.json"
+    controller = None
+    try:
+        controller = LoraController(robot, mission_path)
+        controller.run()
+    except Exception as error:
+        traceback.print_exc()
+        # Even startup failures must be visible to the launcher and acceptance test.
+        result = dict(success=False, reason=f"startup_error: {type(error).__name__}: {error}",
+                      run_id=None, duration=robot.getTime(), final_position=None,
+                      distance_to_goal=None, replans=0, sensors={})
+        try:
+            config = json.loads(mission_path.read_text(encoding="utf-8-sig"))
+            result["run_id"] = config.get("run_id")
+            mission_path.with_name("mission_result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+            if config.get("exit_on_complete", False):
+                robot.simulationQuit(1)
+        except (OSError, ValueError):
+            pass
+        if controller is not None:
+            controller.stop()
 
 
 if __name__ == "__main__":
-    LoraController().run()
+    main()

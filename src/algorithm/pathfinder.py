@@ -1,394 +1,257 @@
-# filepath: LORA/src/algorithm/pathfinder.py
-"""
-L.O.R.A. — Lunar Optimum Routing Algorithm
-Aşama 3-A (FINAL): A* Tabanlı Rota Planlayıcı
+"""Deterministic slope-aware A* on an ENU terrain sample grid.
 
-DEĞİŞİKLİKLER (Final):
-  + plan(start_m, goal_m)           → metre koordinatıyla rota planla
-  + get_next_move(current_pos_m)    → Webots her timestep'te çağırır;
-                                       bir sonraki waypoint'i metre döndürür
-  + replan_from(current_pos_m)      → LIDAR override sonrası acil yeniden plan
-  + _meter_to_cell() / _cell_to_meter() → koordinat köprüsü
-  Mevcut find_path() ve path_statistics() KORUNDU — hiçbir satır silinmedi.
+Rows run along northing (Y), columns along easting (X), and values are
+elevations (Z) in metres. ``world_offset_z`` is retained as a legacy name
+for the second *horizontal* offset; new callers may use ``world_offset_y``.
 """
 
 import heapq
 import math
+import operator
+
 import numpy as np
-from dataclasses import dataclass, field
-from typing import Optional
 
-# ─────────────────────────────────────────────
-#  PARAMETRELERİ BURADAN DEĞİŞTİR
-# ─────────────────────────────────────────────
+MAX_SLOPE_DEG = 20.0
+SLOPE_PENALTY = 5.0
+CELL_SIZE_M = 1.0
+HEURISTIC_WEIGHT = 1.0
+WORLD_OFFSET_X = -250.0
+WORLD_OFFSET_Z = -250.0
+ARRIVAL_RADIUS_M = 0.35
 
-MAX_SLOPE_DEG    = 20.0   # Bu açının üstündeki hücreler geçilemez.
-SLOPE_PENALTY    = 5.0    # Eğim maliyet çarpanı.
+_DIRECTIONS = ((0, 1), (1, 0), (0, -1), (-1, 0),
+               (1, 1), (1, -1), (-1, -1), (-1, 1))
 
-# v2 harita: 500 grid / 500 m → 1.0 m/hücre
-# (Eski v1 harita için 2000m/500grid = 4.0 m kullanın)
-CELL_SIZE_M      = 1.0
-
-HEURISTIC_WEIGHT = 1.2    # 1.0 = optimal, >1.0 = daha hızlı/az optimal
-
-# ElevationGrid merkez ofseti — world_builder.py ile aynı olmalı
-# 500×500 m dünya, (0,0) merkez → offset = -250 m
-WORLD_OFFSET_X   = -250.0
-WORLD_OFFSET_Z   = -250.0
-
-# Waypoint "varıldı" kabul mesafesi (metre)
-ARRIVAL_RADIUS_M = 2.5
-
-# 8 yönlü hareket (dr, dc, base_cost)
-_DIRECTIONS = [
-    ( 0,  1, 1.0), ( 0, -1, 1.0), ( 1,  0, 1.0), (-1,  0, 1.0),
-    ( 1,  1, math.sqrt(2)), ( 1, -1, math.sqrt(2)),
-    (-1,  1, math.sqrt(2)), (-1, -1, math.sqrt(2)),
-]
-
-
-# ─────────────────────────────────────────────
-#  YARDIMCI VERİ YAPISI
-# ─────────────────────────────────────────────
-
-@dataclass(order=True)
-class _Node:
-    """A* öncelik kuyruğu için karşılaştırılabilir düğüm."""
-    f_cost: float
-    g_cost: float             = field(compare=False)
-    pos:    tuple             = field(compare=False)
-    parent: Optional["_Node"] = field(default=None, compare=False)
-
-
-# ─────────────────────────────────────────────
-#  ANA SINIF
-# ─────────────────────────────────────────────
 
 class Pathfinder:
-    """
-    A* tabanlı, eğim-duyarlı rota planlayıcı.
+    """Plan minimum distance-plus-slope-cost routes with optional occupancy.
 
-    Webots entegrasyonu (birincil kullanım):
-        pf = Pathfinder(heightmap)
-        pf.plan(start_m=(gps_x0, gps_z0), goal_m=(gps_x1, gps_z1))
-
-        # Her Webots timestep:
-        target = pf.get_next_move(current_pos_m=(gps_x, gps_z))
-        if target is None:
-            print("Hedefe ulaşıldı / rota tükendi")
-
-    Standalone test (grid koordinatı):
-        path = pf.find_path(start=(r0,c0), goal=(r1,c1))
-        stats = pf.path_statistics(path)
+    ``blocked`` is a shared boolean array: in-place obstacle updates affect
+    subsequent plans. A heuristic weight of 1 gives optimal A*; larger values
+    explicitly select weighted A* and trade optimality for speed.
+    A separate sampled surface-slope mask excludes excessive lateral slopes.
+    This is a conservative grid check, not a full chassis/contact simulation.
     """
 
-    def __init__(self,
-                 heightmap:      np.ndarray,
-                 cell_size:      float = CELL_SIZE_M,
-                 max_slope:      float = MAX_SLOPE_DEG,
-                 slope_penalty:  float = SLOPE_PENALTY,
-                 heuristic_w:    float = HEURISTIC_WEIGHT,
-                 world_offset_x: float = WORLD_OFFSET_X,
-                 world_offset_z: float = WORLD_OFFSET_Z):
-        """
-        Args:
-            heightmap:      2D numpy yükseklik matrisi (satır=Z, sütun=X).
-            cell_size:      Hücre başına metre.
-            max_slope:      Geçilemez eğim eşiği (derece).
-            slope_penalty:  Eğim maliyet çarpanı.
-            heuristic_w:    A* sezgisel ağırlık faktörü.
-            world_offset_x: ElevationGrid X ofseti (metre).
-            world_offset_z: ElevationGrid Z ofseti (metre).
-        """
-        if heightmap.ndim != 2:
-            raise ValueError("heightmap 2 boyutlu numpy dizisi olmalıdır.")
+    def __init__(self, heightmap, cell_size=CELL_SIZE_M,
+                 max_slope=MAX_SLOPE_DEG, slope_penalty=SLOPE_PENALTY,
+                 heuristic_w=HEURISTIC_WEIGHT, world_offset_x=WORLD_OFFSET_X,
+                 world_offset_z=WORLD_OFFSET_Z, blocked=None, *,
+                 world_offset_y=None):
+        terrain = np.asarray(heightmap, dtype=np.float64)
+        if terrain.ndim != 2 or not terrain.size:
+            raise ValueError("heightmap must be a nonempty 2D array")
+        if not np.isfinite(terrain).all():
+            raise ValueError("heightmap must contain only finite elevations")
+        values = (cell_size, max_slope, slope_penalty, heuristic_w,
+                  world_offset_x, world_offset_z)
+        if not all(math.isfinite(float(v)) for v in values):
+            raise ValueError("planner configuration must be finite")
+        if cell_size <= 0 or not 0 < max_slope < 90:
+            raise ValueError("cell_size must be positive and 0 < max_slope < 90")
+        if slope_penalty < 0 or heuristic_w < 1:
+            raise ValueError("slope_penalty must be >= 0 and heuristic_w >= 1")
+        if world_offset_y is not None and not math.isfinite(float(world_offset_y)):
+            raise ValueError("world_offset_y must be finite")
+        self.heightmap = terrain.copy()
+        self.cell_size = float(cell_size)
+        self.max_slope_deg = float(max_slope)
+        self.slope_penalty = float(slope_penalty)
+        self.heuristic_w = float(heuristic_w)
+        self.offset_x = float(world_offset_x)
+        self.offset_y = float(world_offset_z if world_offset_y is None else world_offset_y)
+        self.offset_z = self.offset_y  # legacy horizontal-axis alias
+        self.n_rows, self.n_cols = terrain.shape
+        if blocked is None:
+            blocked = np.zeros(terrain.shape, dtype=bool)
+        if not isinstance(blocked, np.ndarray) or blocked.dtype != np.bool_:
+            raise ValueError("blocked must be a boolean numpy array")
+        if blocked.shape != terrain.shape:
+            raise ValueError("blocked must have the heightmap shape")
+        self.blocked = blocked
+        self._max_grade = math.tan(math.radians(self.max_slope_deg))
+        # Along-edge slope alone misses rollover risk on a contour traverse.
+        # Calculate the total local surface gradient and retain it separately
+        # from mutable LIDAR occupancy. Singleton axes have no measurable grade.
+        with np.errstate(over="ignore", invalid="ignore"):
+            grade_y = (np.gradient(self.heightmap, self.cell_size, axis=0)
+                       if self.n_rows > 1 else np.zeros_like(self.heightmap))
+            grade_x = (np.gradient(self.heightmap, self.cell_size, axis=1)
+                       if self.n_cols > 1 else np.zeros_like(self.heightmap))
+            grade = np.hypot(grade_x, grade_y)
+        self.terrain_blocked = (~np.isfinite(grade) |
+                                (grade > self._max_grade + 1e-12))
+        self._path = []
+        self._path_idx = 0
+        self._waypoints = ()
+        self._goal_m = None
+        self.last_iterations = 0
 
-        self.heightmap      = heightmap.astype(np.float64)
-        self.cell_size      = cell_size
-        self.max_slope_deg  = max_slope
-        self.slope_penalty  = slope_penalty
-        self.heuristic_w    = heuristic_w
-        self.offset_x       = world_offset_x
-        self.offset_z       = world_offset_z
-        self.n_rows, self.n_cols = heightmap.shape
-
-        # Eğim → maksimum geçilebilir dH (metre)
-        self._max_dh_ortho = math.tan(math.radians(max_slope)) * cell_size
-        self._max_dh_diag  = math.tan(math.radians(max_slope)) * cell_size * math.sqrt(2)
-
-        # Aktif rota cache (grid hücre listesi) ve pointer
-        self._path:     list[tuple[int, int]] = []
-        self._path_idx: int   = 0
-        self._goal_m:   Optional[tuple[float, float]] = None
-
-        print(f"[Pathfinder] Grid:{self.n_rows}×{self.n_cols} | "
-              f"Cell:{cell_size}m | MaxSlope:{max_slope}° | "
-              f"Offset:({world_offset_x},{world_offset_z})")
-
-    # ══════════════════════════════════════════
-    #  KOORDİNAT DÖNÜŞÜM YARDIMCILARI
-    # ══════════════════════════════════════════
-
-    def _meter_to_cell(self, x_m: float, z_m: float) -> tuple[int, int]:
-        """
-        Webots dünya koordinatı (metre) → grid (row, col).
-          col ← X ekseni (Webots'ta doğu yönü)
-          row ← Z ekseni (Webots'ta güney yönü)
-        Sınır kırpma uygulanır.
-        """
-        col = int((x_m - self.offset_x) / self.cell_size)
-        row = int((z_m - self.offset_z) / self.cell_size)
-        row = max(0, min(self.n_rows - 1, row))
-        col = max(0, min(self.n_cols - 1, col))
-        return row, col
-
-    def _cell_to_meter(self, row: int, col: int) -> tuple[float, float]:
-        """
-        Grid (row, col) → Webots dünya koordinatı (x_m, z_m).
-        +0.5 ofseti hücrenin merkezini verir.
-        """
-        x_m = (col + 0.5) * self.cell_size + self.offset_x
-        z_m = (row + 0.5) * self.cell_size + self.offset_z
-        return x_m, z_m
-
-    # ══════════════════════════════════════════
-    #  A* ÇEKİRDEĞİ — İÇ YARDIMCILAR
-    # ══════════════════════════════════════════
-
-    def _in_bounds(self, r: int, c: int) -> bool:
+    def _in_bounds(self, r, c):
         return 0 <= r < self.n_rows and 0 <= c < self.n_cols
 
-    def _slope_cost(self, r1: int, c1: int,
-                    r2: int, c2: int,
-                    base_cost: float) -> Optional[float]:
+    def _validate_cell(self, cell):
+        try:
+            r, c = cell
+            if isinstance(r, (bool, np.bool_)) or isinstance(c, (bool, np.bool_)):
+                raise TypeError
+            r, c = operator.index(r), operator.index(c)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("grid coordinates must be two integers") from exc
+        if not self._in_bounds(r, c):
+            raise ValueError(f"grid coordinate {(r, c)} is outside the terrain")
+        return r, c
+
+    def _meter_to_cell(self, x_m, z_m):
+        """Convert horizontal (X, Y) metres to the nearest terrain sample.
+
+        Positions beyond the physical sample extent are rejected, never clipped.
+        The second argument keeps its legacy name for existing callers.
         """
-        İki hücre arasındaki eğim maliyetini hesaplar.
-        Eğim eşiği aşılırsa None döndürür (geçilemez duvar).
-        """
-        dh     = abs(float(self.heightmap[r2, c2]) - float(self.heightmap[r1, c1]))
-        max_dh = self._max_dh_diag if base_cost > 1.0 else self._max_dh_ortho
-        if dh > max_dh:
+        x, y = float(x_m), float(z_m)
+        if not math.isfinite(x) or not math.isfinite(y):
+            raise ValueError("world coordinates must be finite")
+        col = (x - self.offset_x) / self.cell_size
+        row = (y - self.offset_y) / self.cell_size
+        eps = 1e-9
+        if not (-eps <= col <= self.n_cols - 1 + eps and
+                -eps <= row <= self.n_rows - 1 + eps):
+            raise ValueError("world coordinate is outside the terrain")
+        return int(math.floor(row + 0.5)), int(math.floor(col + 0.5))
+
+    def _cell_to_meter(self, row, col):
+        row, col = self._validate_cell((row, col))
+        return (self.offset_x + col * self.cell_size,
+                self.offset_y + row * self.cell_size)
+
+    def _slope_cost(self, r1, c1, r2, c2, base_cost):
+        distance = self.cell_size * base_cost
+        dh = abs(float(self.heightmap[r2, c2] - self.heightmap[r1, c1]))
+        if (self.blocked[r2, c2] or self.terrain_blocked[r2, c2] or
+                dh > self._max_grade * distance + 1e-12):
             return None
-        slope_deg = math.degrees(math.atan2(dh, self.cell_size * base_cost))
-        penalty   = (slope_deg / self.max_slope_deg) ** 2 * self.slope_penalty
-        return base_cost + penalty
+        slope = math.degrees(math.atan2(dh, distance))
+        return distance * (1 + self.slope_penalty * (slope / self.max_slope_deg) ** 2)
 
-    def _heuristic(self, r: int, c: int, gr: int, gc: int) -> float:
-        """Ağırlıklı Öklid sezgiseli."""
-        return self.heuristic_w * math.sqrt((r - gr) ** 2 + (c - gc) ** 2)
+    def _diagonal_clear(self, r, c, nr, nc):
+        # Both adjacent cardinal passages must be usable. This prevents crossing
+        # between blocked cells or jumping diagonally over steep terrain corners.
+        for ar, ac in ((r, nc), (nr, c)):
+            if (self._slope_cost(r, c, ar, ac, 1.0) is None or
+                    self._slope_cost(ar, ac, nr, nc, 1.0) is None):
+                return False
+        return True
 
-    @staticmethod
-    def _reconstruct(node: _Node) -> list[tuple[int, int]]:
-        """Geri iz sürerek tam yolu döndürür."""
-        path, cur = [], node
-        while cur is not None:
-            path.append(cur.pos)
-            cur = cur.parent
-        return list(reversed(path))
+    def _heuristic(self, r, c, gr, gc):
+        dr, dc = abs(r - gr), abs(c - gc)
+        octile = max(dr, dc) + (math.sqrt(2) - 1) * min(dr, dc)
+        return self.heuristic_w * self.cell_size * octile
 
-    # ══════════════════════════════════════════
-    #  GRID KOORDİNATLI ANA ROTA PLANLAMA
-    #  (ORIJINAL — KORUNDU, HİÇBİR SATIR SİLİNMEDİ)
-    # ══════════════════════════════════════════
-
-    def find_path(self,
-                  start: tuple[int, int],
-                  goal:  tuple[int, int]) -> Optional[list[tuple[int, int]]]:
-        """
-        Başlangıçtan hedefe A* ile en güvenli yolu bulur.
-
-        Args:
-            start: (row, col) başlangıç hücre koordinatı.
-            goal:  (row, col) hedef hücre koordinatı.
-
-        Returns:
-            [(r0,c0), (r1,c1), ...] koordinat listesi veya None.
-        """
-        sr, sc = start
-        gr, gc = goal
-
-        for label, (r, c) in [("Başlangıç", (sr, sc)), ("Hedef", (gr, gc))]:
-            if not self._in_bounds(r, c):
-                raise ValueError(f"{label} ({r},{c}) harita sınırları dışında!")
-
-        open_heap: list[_Node]       = []
-        g_costs:   dict[tuple, float] = {start: 0.0}
-        visited:   set[tuple]         = set()
-
-        heapq.heappush(open_heap, _Node(
-            f_cost=self._heuristic(sr, sc, gr, gc),
-            g_cost=0.0, pos=start
-        ))
-
-        iterations = 0
-        while open_heap:
-            current    = heapq.heappop(open_heap)
-            cr, cc     = current.pos
-            iterations += 1
-
-            if current.pos in visited:
+    def find_path(self, start, goal):
+        """Return grid samples from start through goal, or None if unreachable."""
+        start, goal = self._validate_cell(start), self._validate_cell(goal)
+        self.last_iterations = 0
+        if (self.blocked[start] or self.blocked[goal] or
+                self.terrain_blocked[start] or self.terrain_blocked[goal]):
+            return None
+        best = np.full(self.heightmap.shape, math.inf)
+        best[start] = 0.0
+        parents = {}
+        h = self._heuristic(*start, *goal)
+        heap = [(h, h, 0, 0.0, start)]
+        serial = 0
+        while heap:
+            _, _, _, cost, current = heapq.heappop(heap)
+            if cost != best[current]:
                 continue
-            visited.add(current.pos)
-
-            if current.pos == goal:
-                path   = self._reconstruct(current)
-                dist_m = (len(path) - 1) * self.cell_size
-                print(f"[Pathfinder] Rota bulundu ✓ | "
-                      f"{len(path)} adım | ~{dist_m:.0f} m | "
-                      f"{iterations} iterasyon")
+            self.last_iterations += 1
+            if current == goal:
+                path = [goal]
+                while path[-1] != start:
+                    path.append(parents[path[-1]])
+                path.reverse()
                 return path
-
-            for dr, dc, base_move_cost in _DIRECTIONS:
-                nr, nc = cr + dr, cc + dc
-                if not self._in_bounds(nr, nc) or (nr, nc) in visited:
+            r, c = current
+            for dr, dc in _DIRECTIONS:
+                nr, nc = r + dr, c + dc
+                if not self._in_bounds(nr, nc):
                     continue
-                move_cost = self._slope_cost(cr, cc, nr, nc, base_move_cost)
-                if move_cost is None:
+                diagonal = bool(dr and dc)
+                move = self._slope_cost(r, c, nr, nc, math.sqrt(2) if diagonal else 1.0)
+                if move is None or (diagonal and not self._diagonal_clear(r, c, nr, nc)):
                     continue
-                new_g = current.g_cost + move_cost
-                if new_g < g_costs.get((nr, nc), math.inf):
-                    g_costs[(nr, nc)] = new_g
-                    heapq.heappush(open_heap, _Node(
-                        f_cost=new_g + self._heuristic(nr, nc, gr, gc),
-                        g_cost=new_g, pos=(nr, nc), parent=current
-                    ))
-
-        print(f"[Pathfinder] ⚠ Rota bulunamadı! ({iterations} iterasyon)")
+                new_cost = cost + move
+                if new_cost < best[nr, nc]:
+                    best[nr, nc] = new_cost
+                    parents[(nr, nc)] = current
+                    serial += 1
+                    h = self._heuristic(nr, nc, *goal)
+                    heapq.heappush(heap, (new_cost + h, h, serial, new_cost, (nr, nc)))
         return None
 
-    # ══════════════════════════════════════════
-    #  WEBOTS ARAYÜZİ — YENİ EKLENEN METODLAR
-    # ══════════════════════════════════════════
+    @property
+    def waypoints_m(self):
+        """Immutable world-space route, including the exact requested endpoint."""
+        return self._waypoints
 
-    def plan(self,
-             start_m: tuple[float, float],
-             goal_m:  tuple[float, float]) -> bool:
-        """
-        Metre koordinatlarıyla yeni bir rota planlar; dahili path cache'e yazar.
-
-        Webots kontrolcüsü simülasyon başında (ve LIDAR override sonrası) çağırır.
-
-        Args:
-            start_m: (x, z) Webots GPS koordinatı — başlangıç.
-            goal_m:  (x, z) Webots GPS koordinatı — hedef.
-
-        Returns:
-            True: rota bulundu ve cache'e yazıldı.
-            False: ulaşılamaz (harita engeli veya grid dışı).
-        """
-        self._goal_m   = goal_m
-        start_cell     = self._meter_to_cell(*start_m)
-        goal_cell      = self._meter_to_cell(*goal_m)
-
-        path = self.find_path(start_cell, goal_cell)
-        if path:
-            self._path     = path
-            self._path_idx = 0
-            return True
-
-        self._path = []
-        return False
-
-    def get_next_move(self,
-                      current_pos_m:    tuple[float, float],
-                      arrival_radius_m: float = ARRIVAL_RADIUS_M
-                      ) -> Optional[tuple[float, float]]:
-        """
-        Webots kontrolcüsünün her timestep'te çağırdığı navigasyon arayüzü.
-
-        GPS konumunu alır → bir sonraki hedef waypoint'i metre olarak döndürür.
-
-        Mantık:
-          1. GPS → grid hücresi dönüşümü.
-          2. Zaten geçilmiş waypoint'leri atla (arrival_radius kontrolü).
-          3. Sonraki waypoint'in metre koordinatını döndür.
-          4. Tüm path tükendi → None (hedefe ulaşıldı).
-
-        Args:
-            current_pos_m:    (gps_x, gps_z) rover'ın anlık Webots koordinatı.
-            arrival_radius_m: Bu mesafe içine girince waypoint "geçildi" sayılır.
-
-        Returns:
-            (target_x_m, target_z_m) — bir sonraki waypoint (metre).
-            None                     — hedefe ulaşıldı veya rota yok.
-        """
-        if not self._path:
-            return None
-
-        # Zaten geçilmiş waypoint'leri ilerle
-        while self._path_idx < len(self._path) - 1:
-            wp_x, wp_z = self._cell_to_meter(*self._path[self._path_idx])
-            dist = math.sqrt((current_pos_m[0] - wp_x) ** 2 +
-                             (current_pos_m[1] - wp_z) ** 2)
-            if dist <= arrival_radius_m:
-                self._path_idx += 1
-            else:
-                break
-
-        if self._path_idx >= len(self._path):
-            return None
-
-        target_m = self._cell_to_meter(*self._path[self._path_idx])
-
-        # Son waypoint'e yaklaştıysak None döndür (görev tamam)
-        if self._path_idx == len(self._path) - 1:
-            dist = math.sqrt((current_pos_m[0] - target_m[0]) ** 2 +
-                             (current_pos_m[1] - target_m[1]) ** 2)
-            if dist <= arrival_radius_m:
-                return None
-
-        return target_m
-
-    def replan_from(self,
-                    current_pos_m: tuple[float, float],
-                    goal_m: Optional[tuple[float, float]] = None) -> bool:
-        """
-        LIDAR override veya SLAM güncellmesi sonrası acil yeniden planlama.
-
-        Args:
-            current_pos_m: Rover'ın mevcut GPS konumu (metre).
-            goal_m:        Yeni hedef. None → önceki hedef kullanılır.
-
-        Returns:
-            True: yeni rota bulundu.
-        """
-        target = goal_m if goal_m is not None else self._goal_m
-        if target is None:
-            print("[Pathfinder] replan_from: hedef tanımlı değil!")
+    def plan(self, start_m, goal_m):
+        self._path, self._waypoints, self._path_idx = [], (), 0
+        try:
+            start = self._meter_to_cell(*start_m)
+            goal = self._meter_to_cell(*goal_m)
+            self._goal_m = tuple(float(v) for v in goal_m)
+        except (ValueError, TypeError, OverflowError):
+            self._goal_m = None
             return False
-        return self.plan(current_pos_m, target)
+        path = self.find_path(start, goal)
+        if path is None:
+            return False
+        self._path = path
+        points = [self._cell_to_meter(*cell) for cell in path]
+        if len(path) == 1:
+            points = [self._goal_m]
+        elif math.dist(points[-1], self._goal_m) > 1e-9:
+            points.append(self._goal_m)
+        self._waypoints = tuple(points)
+        return True
 
-    # ══════════════════════════════════════════
-    #  İSTATİSTİK (ORIJINAL — KORUNDU)
-    # ══════════════════════════════════════════
+    def get_next_move(self, current_pos_m, arrival_radius_m=ARRIVAL_RADIUS_M):
+        if not math.isfinite(arrival_radius_m) or arrival_radius_m <= 0:
+            raise ValueError("arrival_radius_m must be positive and finite")
+        # Keep accepted radii below half a sample interval so a tight turn cannot
+        # be skipped by a caller using a multi-metre goal tolerance.
+        radius = min(arrival_radius_m, self.cell_size * 0.49)
+        position = tuple(float(v) for v in current_pos_m)
+        if len(position) != 2 or not all(math.isfinite(v) for v in position):
+            raise ValueError("current position must contain two finite coordinates")
+        while self._path_idx < len(self._waypoints):
+            waypoint = self._waypoints[self._path_idx]
+            if math.dist(position, waypoint) > radius:
+                return waypoint
+            self._path_idx += 1
+        return None
 
-    def path_statistics(self, path: list[tuple[int, int]]) -> dict:
-        """
-        Bulunan rota için istatistik sözlüğü döndürür.
-        Görsel raporlama veya loglama için kullanılabilir.
-        """
-        if not path or len(path) < 2:
+    def replan_from(self, current_pos_m, goal_m=None):
+        target = self._goal_m if goal_m is None else goal_m
+        return False if target is None else self.plan(current_pos_m, target)
+
+    def path_statistics(self, path):
+        if not path:
             return {}
+        cells = [self._validate_cell(cell) for cell in path]
+        heights = np.array([self.heightmap[cell] for cell in cells])
+        delta = np.diff(heights)
+        distances = [math.dist(a, b) * self.cell_size for a, b in zip(cells, cells[1:])]
+        if any(d == 0 for d in distances):
+            raise ValueError("a route cannot contain consecutive duplicate samples")
+        slopes = [math.degrees(math.atan2(abs(dh), d)) for dh, d in zip(delta, distances)]
+        return {"step_count": len(cells), "distance_m": sum(distances),
+                "start_height_m": float(heights[0]), "end_height_m": float(heights[-1]),
+                "net_elevation_m": float(heights[-1] - heights[0]),
+                "max_slope_deg": max(slopes, default=0.0),
+                "avg_slope_deg": sum(slopes) / len(slopes) if slopes else 0.0,
+                "climb_m": float(np.maximum(delta, 0).sum()),
+                "descent_m": float(-np.minimum(delta, 0).sum())}
 
-        heights    = [float(self.heightmap[r, c]) for r, c in path]
-        elevations = np.diff(heights)
-        slopes_deg = [
-            math.degrees(math.atan2(abs(dh), self.cell_size))
-            for dh in elevations
-        ]
-
-        return {
-            "step_count":      len(path),
-            "distance_m":      (len(path) - 1) * self.cell_size,
-            "start_height_m":  heights[0],
-            "end_height_m":    heights[-1],
-            "net_elevation_m": heights[-1] - heights[0],
-            "max_slope_deg":   max(slopes_deg),
-            "avg_slope_deg":   sum(slopes_deg) / len(slopes_deg),
-            "climb_m":         sum(max(0,  dh) for dh in elevations),
-            "descent_m":       sum(abs(min(0, dh)) for dh in elevations),
-        }
-
-    def current_path_stats(self) -> dict:
-        """Aktif rotanın istatistiklerini döndürür (plan() sonrası)."""
-        return self.path_statistics(self._path) if self._path else {}
+    def current_path_stats(self):
+        return self.path_statistics(self._path)
